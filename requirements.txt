@@ -1,0 +1,9 @@
+# VectorDB Python requirements
+# This project uses ONLY the Python Standard Library (Python 3.8+)
+# Zero external pip packages are required to run the server.
+#
+# To start the server:
+#   python3 main.py
+#
+# To run tests:
+#   python3 test_db.py

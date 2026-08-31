@@ -1,6 +1,6 @@
-# VectorDB — Build a Vector Database from Scratch in C++
+# VectorDB — Build a Vector Database from Scratch in Python
 
-A fully working **Vector Database** built from scratch in C++ with a web UI.  
+A fully working **Vector Database** built from scratch in pure Python with a web visualizer UI.  
 Implements **HNSW**, **KD-Tree**, and **Brute Force** search algorithms side-by-side, plus a **RAG pipeline** powered by a local LLM via Ollama.
 
 > Built as an educational project to show how production vector databases like Pinecone, Weaviate, and Chroma actually work under the hood.
@@ -18,6 +18,7 @@ Implements **HNSW**, **KD-Tree**, and **Brute Force** search algorithms side-by-
 | **Real Document Embedding** | Paste any text → Ollama embeds it with `nomic-embed-text` (768D) |
 | **RAG Pipeline** | Ask questions about your documents → HNSW retrieves context → local LLM answers |
 | **Full REST API** | CRUD endpoints: insert, delete, search, benchmark, hnsw-info |
+| **Zero Dependencies** | Pure standard library Python 3.8+ — no heavy packages or compilation needed |
 
 ---
 
@@ -30,7 +31,7 @@ Your Text
 Ollama (nomic-embed-text)          ← converts text to a 768-dimensional vector
     │
     ▼
-HNSW Index (C++)                   ← indexes the vector in a multilayer graph
+HNSW Index (Python)                ← indexes the vector in a multilayer graph
     │
     ▼
 Semantic Search                    ← finds nearest neighbors in vector space
@@ -48,139 +49,68 @@ Answer
 
 ## Prerequisites
 
-You need **3 things** installed on your Windows laptop:
+You need **2 things**:
 
-1. **MSYS2** (gives you g++ compiler)
-2. **Git**
-3. **Ollama** (runs the local AI models)
+1. **Python 3.8+** (pre-installed on macOS/Linux, or download from [python.org](https://www.python.org/downloads/))
+2. **Ollama** (for local AI embeddings and generation)
 
 ---
 
-## Step-by-Step Setup (Windows)
+## Step-by-Step Setup
 
-### Step 1 — Install MSYS2 (C++ Compiler)
+### Step 1 — Install Ollama (Local AI Models)
 
-1. Go to **https://www.msys2.org** and download the installer
-2. Run the installer, keep default path (`C:\msys64`)
-3. After install, open **MSYS2 UCRT64** from Start Menu (the orange icon)
-4. Run these commands inside the MSYS2 terminal:
+1. Go to **https://ollama.com** and download Ollama for your OS (macOS, Windows, or Linux).
+2. Open a terminal / command prompt and pull the required models:
 
 ```bash
-pacman -Syu
-```
-*(Close and reopen the terminal if it asks you to)*
-
-```bash
-pacman -S mingw-w64-ucrt-x86_64-gcc
-```
-
-5. Add g++ to your Windows PATH:
-   - Press `Win + R`, type `sysdm.cpl`, press Enter
-   - Click **Advanced** → **Environment Variables**
-   - Under **System variables**, find **Path**, click **Edit**
-   - Click **New** and add: `C:\msys64\ucrt64\bin`
-   - Click OK on all windows
-   - **Open a new PowerShell** and verify:
-   ```
-   g++ --version
-   ```
-   You should see something like `g++ (GCC) 15.x.x`
-
----
-
-### Step 2 — Install Git
-
-1. Go to **https://git-scm.com/download/win** and download Git for Windows
-2. Run the installer with default settings
-3. Verify in PowerShell:
-```
-git --version
-```
-
----
-
-### Step 3 — Install Ollama (Local AI Models)
-
-1. Go to **https://ollama.com** and click **Download for Windows**
-2. Run the installer
-3. Ollama starts automatically in the system tray
-4. Open **PowerShell** and pull the two required models:
-
-```powershell
 ollama pull nomic-embed-text
 ```
-*(~274 MB — this is the embedding model)*
+*(~274 MB — embedding model)*
 
-```powershell
+```bash
 ollama pull llama3.2
 ```
-*(~2 GB — this is the language model)*
+*(~2 GB — language model)*
 
-5. Verify Ollama is running:
-```powershell
+3. Verify Ollama is running:
+```bash
 ollama list
 ```
-You should see both models listed.
-
-> **Minimum specs for Ollama:** 8GB RAM recommended. The models will use ~3GB total.
 
 ---
 
-### Step 4 — Clone the Repository
+### Step 2 — Run the Python VectorDB Server
 
-Open **PowerShell** and run:
+No compilation or pip installations needed. Just run:
 
-```powershell
-git clone https://github.com/YOUR_USERNAME/VectorDB.git
-cd VectorDB
+```bash
+python3 main.py
 ```
-
-*(Replace `YOUR_USERNAME` with the actual GitHub username)*
-
----
-
-### Step 5 — Compile the C++ Server
-
-Inside the `VectorDB` folder, run:
-
-```powershell
-g++ -std=c++17 -O2 main.cpp -o db -lws2_32
-```
-
-This produces `db.exe`. It takes about 10–20 seconds.
-
-> **Troubleshooting:**
-> - `g++: command not found` → MSYS2 not in PATH, redo Step 1 point 5
-> - `undefined reference to WSA...` → missing `-lws2_32` flag, add it
-> - Takes too long? Remove `-O2` for faster (but slower executable) compile
-
----
-
-### Step 6 — Run Everything
-
-**Terminal 1** — Start Ollama (if not already running):
-```powershell
-ollama serve
-```
-*(If Ollama is already in the system tray, skip this)*
-
-**Terminal 2** — Start the VectorDB server:
-```powershell
-./db
-```
+*(or `python main.py` on Windows)*
 
 You should see:
-```
-=== VectorDB Engine ===
+```text
+=== VectorDB Engine (Python) ===
 http://localhost:8080
 20 demo vectors | 16 dims | HNSW+KD-Tree+BruteForce
 Ollama: ONLINE
   embed model: nomic-embed-text  gen model: llama3.2
 ```
 
-**Open your browser** and go to:
+**Open your browser** and visit:
 ```
 http://localhost:8080
+```
+
+---
+
+### Step 3 — (Optional) Run Tests
+
+Run the full automated test suite (distance metrics, algorithms, document database, HTTP server):
+
+```bash
+python3 test_db.py
 ```
 
 ---
@@ -248,20 +178,21 @@ The server exposes a full REST API at `http://localhost:8080`.
 | `POST` | `/doc/insert` | `{"title":"...","text":"..."}` | Embed and store document |
 | `GET` | `/doc/list` | — | List all stored documents |
 | `DELETE` | `/doc/delete/:id` | — | Delete document chunk |
+| `POST` | `/doc/search` | `{"question":"...","k":3}` | Retrieve relevant document chunks |
 | `POST` | `/doc/ask` | `{"question":"...","k":3}` | RAG: retrieve + generate |
 | `GET` | `/status` | — | Ollama status and model info |
 
 ### Example: Search via curl
 
-```powershell
+```bash
 curl "http://localhost:8080/search?v=0.9,0.8,0.7,0.6,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1&k=3&metric=cosine&algo=hnsw"
 ```
 
 ### Example: Ask a question via curl
 
-```powershell
-curl -X POST http://localhost:8080/doc/ask `
-  -H "Content-Type: application/json" `
+```bash
+curl -X POST http://localhost:8080/doc/ask \
+  -H "Content-Type: application/json" \
   -d '{"question":"What is dynamic programming?","k":3}'
 ```
 
@@ -270,22 +201,23 @@ curl -X POST http://localhost:8080/doc/ask `
 ## Project Structure
 
 ```
-VectorDB/
-├── main.cpp        ← C++ backend (HNSW, KD-Tree, BruteForce, REST API, RAG)
-├── httplib.h       ← Single-header HTTP server library (cpp-httplib)
-├── index.html      ← Frontend (PCA scatter plot, chat UI, benchmark)
-└── README.md       ← This file
+Your-OWN-AI/
+├── main.py          ← Python backend (HNSW, KD-Tree, BruteForce, REST API, RAG)
+├── test_db.py       ← Unit & integration test suite
+├── index.html       ← Frontend visualizer (PCA scatter plot, chat UI, benchmark)
+├── requirements.txt ← Standard library zero-dependency notice
+└── README.md        ← This documentation
 ```
 
-### Architecture (main.cpp)
+### Architecture (`main.py`)
 
 ```
-BruteForce          O(N·d)      Exact, baseline
-KDTree              O(log N)    Exact, axis-aligned partitioning
-HNSW                O(log N)    Approximate, multilayer small-world graph
+BruteForce          O(N·d)      Exact baseline search
+KDTree              O(log N)    Exact axis-aligned partitioning with hyper-plane pruning
+HNSW                O(log N)    Approximate nearest neighbor multilayer graph
 
 VectorDB            Unified interface over all 3 (16D demo vectors)
-DocumentDB          HNSW-only index for real Ollama embeddings (768D)
+DocumentDB          HNSW index for real Ollama embeddings (768D)
 OllamaClient        HTTP client → /api/embeddings + /api/generate
 ```
 
@@ -295,23 +227,21 @@ OllamaClient        HTTP client → /api/embeddings + /api/generate
 
 ### HNSW (Hierarchical Navigable Small World)
 
-Nodes are inserted into a multilayer graph. Each node randomly gets assigned a maximum layer. Layer 0 has all nodes with many connections; higher layers have fewer nodes (exponentially fewer) with longer-range connections.
+Nodes are inserted into a multilayer graph. Each node randomly gets assigned a maximum layer via $m_L = 1/\ln(M)$. Layer 0 has all nodes with many connections; higher layers have fewer nodes (exponentially fewer) with longer-range connections.
 
-**Insert:** Start at the top layer, greedily find the nearest node, drop a layer, repeat. At each layer from your assigned max down to 0, run a beam search (ef_construction=200) and connect to the M nearest neighbors bidirectionally.
-
-**Search:** Same greedy descent from top layer. At layer 0, expand to ef nearest candidates using a priority queue.
-
-**Why it's fast:** The upper layers act like a highway — you quickly get to the right neighborhood, then zoom in at layer 0.
+- **Insert:** Start at the top layer, greedily find the nearest node, drop a layer, repeat. At each layer from your assigned max down to 0, run a beam search (`ef_construction=200`) and connect to the $M$ nearest neighbors bidirectionally.
+- **Search:** Same greedy descent from top layer. At layer 0, expand to `ef` nearest candidates using a priority queue.
+- **Why it's fast:** The upper layers act like an express highway — you quickly reach the right neighborhood, then zoom in at layer 0.
 
 ### KD-Tree (K-Dimensional Tree)
 
 Binary space partitioning. Each node splits space along one dimension (cycling through all dimensions). Search prunes entire subtrees when the closest possible point in that subtree can't beat the current best — the "ball within hyperslab" check.
 
-**Weakness:** Degrades with high dimensions (curse of dimensionality). Works well for ≤20D, becomes close to brute force at 768D.
+- **Weakness:** Degrades with high dimensions (curse of dimensionality). Works well for $\le 20\text{D}$, becomes close to brute force at 768D.
 
 ### Why HNSW Wins at High Dimensions
 
-KD-Tree pruning relies on axis-aligned distance bounds. In high dimensions, almost all the space is near the boundary of the hypersphere — no subtrees get pruned. HNSW's graph-based approach doesn't have this problem.
+KD-Tree pruning relies on axis-aligned distance bounds. In high dimensions, almost all the space is near the boundary of the hypersphere — no subtrees get pruned. HNSW's graph-based approach doesn't suffer from this geometric constraint.
 
 ---
 
@@ -320,24 +250,22 @@ KD-Tree pruning relies on axis-aligned distance bounds. In high dimensions, almo
 | Problem | Fix |
 |---|---|
 | `Ollama: OFFLINE` in header | Run `ollama serve` in a terminal |
-| Embedding takes forever | Ollama is downloading the model on first use, wait 2 min |
-| `g++: command not found` | Add `C:\msys64\ucrt64\bin` to Windows PATH |
-| Port 8080 already in use | Kill the process: `netstat -ano \| findstr 8080` then `taskkill /PID <pid> /F` |
-| LLM answer is slow | Normal — llama3.2 takes 10–30s on a laptop CPU. Use llama3.2:1b for faster answers |
+| Embedding takes a moment | Ollama is loading the model on first use |
+| Port 8080 already in use | Set custom port: `PORT=8081 python3 main.py` |
+| LLM answer is slow | llama3.2 takes 10–30s on CPU. Use `llama3.2:1b` for faster answers |
 
 ### Use a Smaller/Faster LLM
 
-If llama3.2 is too slow on your laptop, switch to the 1B model:
+If `llama3.2` is slow on your machine, switch to the 1B model:
 
-```powershell
+```bash
 ollama pull llama3.2:1b
 ```
 
-Then edit [main.cpp](main.cpp) line where `genModel` is set:
-```cpp
-std::string genModel = "llama3.2:1b";   // change this
+Then edit [main.py](file:///Users/shivamsingh/Your-OWN-AI/Your-OWN-AI/main.py) where `gen_model` is initialized:
+```python
+gen_model: str = "llama3.2:1b"
 ```
-Recompile and restart.
 
 ---
 
