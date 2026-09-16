@@ -1,18 +1,24 @@
 """
-Unit and integration tests for Python VectorDB.
-Tests all search algorithms (HNSW, KD-Tree, BruteForce), distance metrics,
-chunking, document store, and HTTP REST endpoints.
+Unit and integration tests for VectorDB with ChromaDB + HNSW.
+Tests all search algorithms (ChromaDB, HNSW, KD-Tree, BruteForce), distance metrics,
+chunking, document store, persistence, and HTTP REST endpoints.
 """
 
 import json
 import math
+import os
+import shutil
 import threading
 import time
 import unittest
 import urllib.request
 import urllib.parse
+
+from fastapi.testclient import TestClient
+
 from main import (
     DIMS,
+    CHROMA_AVAILABLE,
     VectorItem,
     DocItem,
     euclidean,
@@ -24,10 +30,15 @@ from main import (
     HNSW,
     VectorDB,
     DocumentDB,
+    OllamaClient,
+    LinearRAG,
     chunk_text,
-    create_server,
+    create_app,
     load_demo,
 )
+
+if CHROMA_AVAILABLE:
+    import chromadb
 
 
 class TestDistanceMetrics(unittest.TestCase):
@@ -123,10 +134,10 @@ class TestVectorDB(unittest.TestCase):
         cs_query = [0.9, 0.8, 0.7, 0.6, 0.1, 0.1, 0.1, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
 
         # Test search with HNSW, KDTree, BruteForce
-        for algo in ["hnsw", "kdtree", "bruteforce"]:
+        algos = ["hnsw", "kdtree", "bruteforce"]
+        for algo in algos:
             res = db.search(cs_query, 3, "cosine", algo)
             self.assertEqual(len(res["results"]), 3)
-            # Top results should belong to 'cs' category
             self.assertEqual(res["results"][0]["category"], "cs")
 
         # Test benchmark
@@ -142,6 +153,63 @@ class TestVectorDB(unittest.TestCase):
         ok = db.remove(new_id)
         self.assertTrue(ok)
         self.assertEqual(db.size(), 20)
+
+
+import tempfile
+
+class TestChromaDBIntegration(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="chroma_unit_")
+        if CHROMA_AVAILABLE:
+            self.client = chromadb.PersistentClient(path=self.test_dir)
+        else:
+            self.client = None
+
+    def tearDown(self):
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_chroma_vector_db_search_and_bench(self):
+        if not CHROMA_AVAILABLE:
+            self.skipTest("chromadb not installed")
+
+        db = VectorDB(dims=DIMS, chroma_client=self.client)
+        load_demo(db)
+        self.assertEqual(db.size(), 20)
+
+        cs_query = [0.9, 0.8, 0.7, 0.6, 0.1, 0.1, 0.1, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+        res = db.search(cs_query, 3, "cosine", "chromadb")
+        self.assertEqual(len(res["results"]), 3)
+        self.assertEqual(res["results"][0]["category"], "cs")
+        self.assertIn("latencyUs", res)
+
+        bench = db.benchmark(cs_query, 5, "cosine")
+        self.assertIn("chromadbUs", bench)
+        self.assertGreaterEqual(bench["chromadbUs"], 0)
+
+    def test_chroma_document_persistence(self):
+        if not CHROMA_AVAILABLE:
+            self.skipTest("chromadb not installed")
+
+        doc_db1 = DocumentDB(chroma_client=self.client)
+        emb1 = [0.9, 0.1, 0.0, 0.0]
+        emb2 = [0.0, 0.0, 0.9, 0.1]
+
+        id1 = doc_db1.insert("Doc Algorithms", "Algorithms content", emb1)
+        id2 = doc_db1.insert("Doc Cooking", "Cooking content", emb2)
+        self.assertEqual(doc_db1.size(), 2)
+
+        # Search with doc_db1
+        hits = doc_db1.search([0.85, 0.15, 0.0, 0.0], k=1, max_dist=0.7)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0][1].id, id1)
+
+        # Simulate server restart by creating doc_db2 connected to same persistent storage
+        doc_db2 = DocumentDB(chroma_client=self.client)
+        self.assertEqual(doc_db2.size(), 2)
+        hits2 = doc_db2.search([0.85, 0.15, 0.0, 0.0], k=1, max_dist=0.7)
+        self.assertEqual(len(hits2), 1)
+        self.assertEqual(hits2[0][1].id, id1)
 
 
 class TestTextChunkerAndDocumentDB(unittest.TestCase):
@@ -172,106 +240,158 @@ class TestTextChunkerAndDocumentDB(unittest.TestCase):
         self.assertEqual(doc_db.size(), 1)
 
 
-class TestHttpServer(unittest.TestCase):
+class TestFastAPIEndpoints(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.test_port = 8899
-        cls.server = create_server("127.0.0.1", cls.test_port)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        time.sleep(0.2)
+        import tempfile
+        cls.test_data = tempfile.mkdtemp(prefix="chroma_fastapi_")
+        cls.app = create_app(db_path=cls.test_data)
+        cls.client = TestClient(cls.app)
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-
-    def _get(self, path):
-        req = urllib.request.Request(f"http://127.0.0.1:{self.test_port}{path}")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, resp.headers, resp.read()
-
-    def _post(self, path, payload):
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{self.test_port}{path}",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, resp.headers, resp.read()
-
-    def _delete(self, path):
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{self.test_port}{path}", method="DELETE"
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, resp.headers, resp.read()
+        if os.path.exists(cls.test_data):
+            shutil.rmtree(cls.test_data, ignore_errors=True)
 
     def test_get_index_html(self):
-        status, headers, body = self._get("/")
-        self.assertEqual(status, 200)
-        self.assertIn(b"VectorDB", body)
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("VectorDB", resp.text)
+        self.assertIn("FASTAPI", resp.text)
+
+    def test_swagger_docs(self):
+        resp = self.client.get("/docs")
+        self.assertEqual(resp.status_code, 200)
+        resp_schema = self.client.get("/openapi.json")
+        self.assertEqual(resp_schema.status_code, 200)
+        self.assertIn("VectorDB & Linear RAG API", resp_schema.json()["info"]["title"])
 
     def test_get_items(self):
-        status, _, body = self._get("/items")
-        self.assertEqual(status, 200)
-        items = json.loads(body.decode("utf-8"))
+        resp = self.client.get("/items")
+        self.assertEqual(resp.status_code, 200)
+        items = resp.json()
         self.assertEqual(len(items), 20)
 
     def test_get_stats(self):
-        status, _, body = self._get("/stats")
-        self.assertEqual(status, 200)
-        stats = json.loads(body.decode("utf-8"))
+        resp = self.client.get("/stats")
+        self.assertEqual(resp.status_code, 200)
+        stats = resp.json()
         self.assertEqual(stats["count"], 20)
         self.assertEqual(stats["dims"], 16)
+        self.assertEqual(stats["backendFramework"], "FastAPI")
 
     def test_get_status(self):
-        status, _, body = self._get("/status")
-        self.assertEqual(status, 200)
-        res = json.loads(body.decode("utf-8"))
+        resp = self.client.get("/status")
+        self.assertEqual(resp.status_code, 200)
+        res = resp.json()
         self.assertIn("ollamaAvailable", res)
         self.assertEqual(res["demoCount"], 20)
+        self.assertIn("FastAPI", res["backendFramework"])
 
-    def test_get_search(self):
+    def test_get_search_hnsw_and_chroma(self):
         v = ",".join(["0.1"] * 16)
-        status, _, body = self._get(f"/search?v={v}&k=3&metric=cosine&algo=hnsw")
-        self.assertEqual(status, 200)
-        res = json.loads(body.decode("utf-8"))
+        resp = self.client.get(f"/search?v={v}&k=3&metric=cosine&algo=hnsw")
+        self.assertEqual(resp.status_code, 200)
+        res = resp.json()
         self.assertEqual(len(res["results"]), 3)
+
+        if CHROMA_AVAILABLE:
+            resp_c = self.client.get(f"/search?v={v}&k=3&metric=cosine&algo=chromadb")
+            self.assertEqual(resp_c.status_code, 200)
+            res_c = resp_c.json()
+            self.assertEqual(len(res_c["results"]), 3)
+            self.assertEqual(res_c["algo"], "chromadb")
 
     def test_get_benchmark(self):
         v = ",".join(["0.1"] * 16)
-        status, _, body = self._get(f"/benchmark?v={v}&k=3&metric=cosine")
-        self.assertEqual(status, 200)
-        res = json.loads(body.decode("utf-8"))
+        resp = self.client.get(f"/benchmark?v={v}&k=3&metric=cosine")
+        self.assertEqual(resp.status_code, 200)
+        res = resp.json()
         self.assertIn("hnswUs", res)
 
     def test_get_hnsw_info(self):
-        status, _, body = self._get("/hnsw-info")
-        self.assertEqual(status, 200)
-        res = json.loads(body.decode("utf-8"))
+        resp = self.client.get("/hnsw-info")
+        self.assertEqual(resp.status_code, 200)
+        res = resp.json()
         self.assertIn("nodes", res)
         self.assertIn("edges", res)
 
     def test_insert_and_delete_vector(self):
-        # Insert
         payload = {
-            "metadata": "Custom item",
+            "metadata": "Custom FastAPI item",
             "category": "cs",
             "embedding": [0.5] * 16,
         }
-        status, _, body = self._post("/insert", payload)
-        self.assertEqual(status, 200)
-        res = json.loads(body.decode("utf-8"))
-        item_id = res["id"]
+        resp = self.client.post("/insert", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        item_id = resp.json()["id"]
 
-        # Delete
-        status, _, body = self._delete(f"/delete/{item_id}")
-        self.assertEqual(status, 200)
-        res = json.loads(body.decode("utf-8"))
-        self.assertTrue(res["ok"])
+        del_resp = self.client.delete(f"/delete/{item_id}")
+        self.assertEqual(del_resp.status_code, 200)
+        self.assertTrue(del_resp.json()["ok"])
+
+    def test_status_endpoint_reports_langgraph(self):
+        resp = self.client.get("/status")
+        self.assertEqual(resp.status_code, 200)
+        res = resp.json()
+        self.assertIn("ragWorkflow", res)
+        self.assertEqual(res["ragWorkflow"], "Linear RAG")
+        self.assertIn("vectorDbEngine", res)
+
+
+class TestLinearRAG(unittest.TestCase):
+    def setUp(self):
+        class MockOllamaClient:
+            def __init__(self):
+                self.embed_model = "nomic-embed-text"
+                self.gen_model = "llama3.2"
+                self.base_url = "http://mock-ollama:11434"
+
+            def embed(self, text: str):
+                t = text.lower()
+                if "python" in t or "programming" in t or "code" in t:
+                    return [0.9, 0.8, 0.1, 0.1]
+                if "pizza" in t or "recipe" in t or "food" in t:
+                    return [0.1, 0.1, 0.9, 0.8]
+                return [0.5, 0.5, 0.5, 0.5]
+
+            def generate(self, prompt: str):
+                return "Python is a high-level, general-purpose programming language."
+
+        self.mock_ollama = MockOllamaClient()
+        self.doc_db = DocumentDB()
+        self.doc_db.insert(
+            "Python Overview",
+            "Python is a high-level interpreted programming language created by Guido van Rossum.",
+            [0.9, 0.8, 0.1, 0.1]
+        )
+        self.doc_db.insert(
+            "Pizza Recipe",
+            "Neapolitan pizza dough requires flour, water, yeast, and salt with San Marzano tomatoes.",
+            [0.1, 0.1, 0.9, 0.8]
+        )
+
+    def test_linear_rag_initialization(self):
+        rag = LinearRAG(self.doc_db, self.mock_ollama)  # type: ignore
+        self.assertIsNotNone(rag.doc_db)
+        self.assertIsNotNone(rag.ollama)
+
+    def test_linear_rag_execution(self):
+        rag = LinearRAG(self.doc_db, self.mock_ollama)  # type: ignore
+        res = rag.run("Tell me about Python programming", k=2)
+        self.assertIn("answer", res)
+        self.assertEqual(res.get("workflow"), "Linear RAG")
+        self.assertIn("steps", res)
+        self.assertGreaterEqual(len(res["steps"]), 2)
+
+        # Check step actions
+        step_names = [s.get("step") for s in res["steps"]]
+        self.assertIn("retrieve", step_names)
+        self.assertIn("generate", step_names)
+
+        # Contexts returned
+        self.assertGreaterEqual(len(res["contexts"]), 1)
+        self.assertEqual(res["contexts"][0]["title"], "Python Overview")
 
 
 if __name__ == "__main__":

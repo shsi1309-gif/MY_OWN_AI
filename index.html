@@ -149,6 +149,56 @@ button {
 .typing::after { content: '▋'; animation: blink 1s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* ── LANGGRAPH AGENTIC TRACE ── */
+.trace-box {
+  background: rgba(108, 99, 255, 0.05);
+  border: 1px solid rgba(108, 99, 255, 0.25);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.trace-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 600;
+}
+.trace-badge {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(108, 99, 255, 0.2);
+  color: var(--accent);
+  border: 1px solid rgba(108, 99, 255, 0.4);
+}
+.trace-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 11px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  line-height: 1.4;
+}
+.trace-step.retrieve { border-left: 3px solid var(--cs); }
+.trace-step.grade_documents { border-left: 3px solid var(--math); }
+.trace-step.rewrite_query { border-left: 3px solid var(--food); }
+.trace-step.generate { border-left: 3px solid var(--green); }
+.trace-step.hallucination_check { border-left: 3px solid var(--accent); }
+.trace-icon { font-size: 12px; flex-shrink: 0; }
+.trace-content { flex: 1; }
+.trace-node { font-weight: 600; color: var(--text); font-size: 11px; }
+.trace-detail { color: var(--muted); font-size: 10.5px; margin-top: 1px; }
+
 /* ── TOOLTIP ── */
 #tip { position: fixed; display: none; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 7px 11px; font-size: 11px; pointer-events: none; max-width: 220px; z-index: 200; line-height: 1.5; }
 
@@ -161,9 +211,10 @@ button {
 
 <header>
   <h1>VectorDB</h1>
-  <span class="badge hl">HNSW</span>
-  <span class="badge">KD-TREE</span>
-  <span class="badge">BRUTE FORCE</span>
+  <span class="badge hl">CHROMADB</span>
+  <span class="badge">HNSW</span>
+  <span class="badge hl" id="langgraphBadge">LINEAR RAG</span>
+  <a href="/docs" target="_blank" class="badge" style="color:var(--cs);border-color:var(--cs);text-decoration:none">⚡ FASTAPI /docs ↗</a>
   <span class="badge" id="ollamaBadge">OLLAMA…</span>
   <span id="statsLabel">loading…</span>
 </header>
@@ -182,9 +233,10 @@ button {
     <div>
       <div class="sec">Algorithm</div>
       <div class="algo-row">
-        <div class="algo-btn on" data-algo="hnsw"      onclick="setAlgo(this)">HNSW</div>
-        <div class="algo-btn"   data-algo="kdtree"     onclick="setAlgo(this)">KD-TREE</div>
-        <div class="algo-btn"   data-algo="bruteforce" onclick="setAlgo(this)">BRUTE</div>
+        <div class="algo-btn on" data-algo="chromadb"   onclick="setAlgo(this)">CHROMA</div>
+        <div class="algo-btn"    data-algo="hnsw"       onclick="setAlgo(this)">HNSW</div>
+        <div class="algo-btn"    data-algo="kdtree"     onclick="setAlgo(this)">KD-TREE</div>
+        <div class="algo-btn"    data-algo="bruteforce" onclick="setAlgo(this)">BRUTE</div>
       </div>
     </div>
     <div>
@@ -272,8 +324,16 @@ button {
     <!-- TAB: DOCUMENTS -->
     <div class="tab-content" id="tab-docs">
       <div>
-        <div class="sec">Ollama Status</div>
+        <div class="sec">AI Server Configuration</div>
         <div class="ollama-status" id="ollamaStatus">Checking…</div>
+        <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+          <input type="text" id="serverUrlInput" placeholder="Remote Server URL (e.g. http://192.168.1.50:11434)" />
+          <div style="display:flex;gap:6px">
+            <input type="text" id="serverEmbedInput" placeholder="nomic-embed-text" style="flex:1" />
+            <input type="text" id="serverGenInput" placeholder="llama3.2" style="flex:1" />
+          </div>
+          <button class="btn-s" onclick="saveServerConfig()">🔗 CONNECT REMOTE SERVER</button>
+        </div>
       </div>
       <div>
         <div class="sec">Insert Document</div>
@@ -336,7 +396,7 @@ const DIM_COL = ['#00d9ff','#00d9ff','#00d9ff','#00d9ff','#b388ff','#b388ff','#b
 //  STATE
 // ════════════════════════════════════════════════════════════
 let allItems = [], pcaPoints = [], hitIds = new Set(), queryPt = null;
-let hoverItem = null, pulse = 0, selAlgo = 'hnsw', searchResults = [];
+let hoverItem = null, pulse = 0, selAlgo = 'chromadb', searchResults = [];
 
 // ════════════════════════════════════════════════════════════
 //  TABS
@@ -382,8 +442,18 @@ function textToEmbedding(text) {
 }
 
 // ════════════════════════════════════════════════════════════
-//  PCA
+//  PCA & PROJECTION
 // ════════════════════════════════════════════════════════════
+let pcaModel = null;
+
+function projectToPCA(emb) {
+  if (!pcaModel || !pcaModel.mean || !pcaModel.pc1 || !pcaModel.pc2) return null;
+  const centered = emb.map((v, i) => v - (pcaModel.mean[i] || 0));
+  const x = centered.reduce((s, v, i) => s + v * (pcaModel.pc1[i] || 0), 0);
+  const y = centered.reduce((s, v, i) => s + v * (pcaModel.pc2[i] || 0), 0);
+  return { x, y };
+}
+
 function pca2D(embs) {
   const n = embs.length, d = embs[0].length;
   if (n < 2) return embs.map(() => [0,0]);
@@ -408,6 +478,7 @@ function pca2D(embs) {
     return v;
   }
   const pc1=powerIter(X,null), pc2=powerIter(X,pc1);
+  pcaModel = { mean, pc1, pc2 };
   return X.map(x=>[x.reduce((s,v,i)=>s+v*pc1[i],0),x.reduce((s,v,i)=>s+v*pc2[i],0)]);
 }
 
@@ -421,8 +492,13 @@ function resize() { const r=sc.parentElement.getBoundingClientRect(); sc.width=r
 window.addEventListener('resize', resize);
 
 function w2c(wx,wy) {
-  const P=70,W=sc.width,H=sc.height,rx=bounds.maxX-bounds.minX||1,ry=bounds.maxY-bounds.minY||1;
-  return [P+((wx-bounds.minX)/rx)*(W-2*P), H-P-((wy-bounds.minY)/ry)*(H-2*P)];
+  const P=70,W=sc.width,H=sc.height;
+  const minX = Math.min(bounds.minX, queryPt ? queryPt.x - 0.08 : bounds.minX);
+  const maxX = Math.max(bounds.maxX, queryPt ? queryPt.x + 0.08 : bounds.maxX);
+  const minY = Math.min(bounds.minY, queryPt ? queryPt.y - 0.08 : bounds.minY);
+  const maxY = Math.max(bounds.maxY, queryPt ? queryPt.y + 0.08 : bounds.maxY);
+  const rx=maxX-minX||1, ry=maxY-minY||1;
+  return [P+((wx-minX)/rx)*(W-2*P), H-P-((wy-minY)/ry)*(H-2*P)];
 }
 
 function drawFrame() {
@@ -532,6 +608,10 @@ async function runSearch() {
   const text=document.getElementById('qInput').value.trim(); if(!text)return;
   const emb=textToEmbedding(text),k=parseInt(document.getElementById('kSlider').value);
   const metric=document.getElementById('metric').value;
+
+  // Set query point on map immediately
+  queryPt = projectToPCA(emb);
+
   const url=`${API}/search?v=${emb.join(',')}&k=${k}&metric=${metric}&algo=${selAlgo}`;
   try {
     const r=await fetch(url), data=await r.json();
@@ -539,7 +619,7 @@ async function runSearch() {
     const us=data.latencyUs||0;
     document.getElementById('latBig').textContent=us<1000?us+' μs':(us/1000).toFixed(2)+' ms';
     document.getElementById('latSub').textContent=selAlgo.toUpperCase()+'  ·  '+metric+'  ·  k='+k;
-    if (searchResults.length>0){
+    if (!queryPt && searchResults.length>0){
       let sx=0,sy=0,sw=0;
       for (let i=0;i<Math.min(3,searchResults.length);i++){
         const pt=pcaPoints.find(p=>p.item.id===searchResults[i].id);
@@ -592,12 +672,16 @@ async function runBenchmark() {
     const r=await fetch(`${API}/benchmark?v=${emb.join(',')}&k=5&metric=${metric}`);
     const d=await r.json();
     document.getElementById('benchSec').style.display='block';
-    const mx=Math.max(d.bruteforceUs,d.kdtreeUs,d.hnswUs,1);
-    document.getElementById('benchBars').innerHTML=[
-      {lbl:'Brute Force',us:d.bruteforceUs,col:'#f38ba8'},
-      {lbl:'KD-Tree',    us:d.kdtreeUs,    col:'#89dceb'},
-      {lbl:'HNSW',       us:d.hnswUs,      col:'#b388ff'},
-    ].map(({lbl,us,col})=>{
+    const entries = [];
+    if (d.chromadbUs !== undefined && d.chromadbUs > 0) {
+      entries.push({lbl:'ChromaDB', us:d.chromadbUs, col:'#00d9ff'});
+    }
+    entries.push({lbl:'HNSW (Custom)', us:d.hnswUs, col:'#b388ff'});
+    entries.push({lbl:'KD-Tree', us:d.kdtreeUs, col:'#89dceb'});
+    entries.push({lbl:'Brute Force', us:d.bruteforceUs, col:'#f38ba8'});
+
+    const mx=Math.max(...entries.map(e=>e.us), 1);
+    document.getElementById('benchBars').innerHTML=entries.map(({lbl,us,col})=>{
       const pct=Math.max((us/mx)*100,2),disp=us<1000?us+' μs':(us/1000).toFixed(2)+' ms';
       return `<div class="brow"><div class="blabel"><span style="color:${col}">${lbl}</span><span style="color:var(--muted)">${disp}</span></div><div class="btrack"><div class="bfill" style="width:${pct}%;background:${col}"></div></div></div>`;
     }).join('');
@@ -641,25 +725,61 @@ async function checkOllamaStatus() {
   try {
     const r=await fetch(API+'/status'), d=await r.json();
     const badge=document.getElementById('ollamaBadge');
+    const lgBadge=document.getElementById('langgraphBadge');
     const box=document.getElementById('ollamaStatus');
+    const urlInput=document.getElementById('serverUrlInput');
+    const embedInput=document.getElementById('serverEmbedInput');
+    const genInput=document.getElementById('serverGenInput');
+
+    if (urlInput && !urlInput.value) urlInput.value = d.ollamaUrl || 'http://127.0.0.1:11434';
+    if (embedInput && !embedInput.value) embedInput.value = d.embedModel || 'nomic-embed-text';
+    if (genInput && !genInput.value) genInput.value = d.genModel || 'llama3.2';
+
+    if (lgBadge) {
+      lgBadge.className = 'badge hl';
+      lgBadge.textContent = 'LINEAR RAG ✓';
+    }
+
+    const vdbInfo = d.chromaAvailable ? `<span style="color:var(--cs)">● ChromaDB (Persistent: ${d.persistencePath})</span><br>` : '';
+    const ragInfo = `<span style="color:var(--accent)">● RAG Engine: Linear Context Injection</span><br>`;
     if (d.ollamaAvailable) {
-      badge.className='badge ok'; badge.textContent='OLLAMA ✓';
+      badge.className='badge ok'; badge.textContent='AI ONLINE ✓';
       box.className='ollama-status ok';
-      box.innerHTML=`<span style="color:var(--green)">● Online</span><br>`+
-        `Embed: <span style="color:var(--accent)">${d.embedModel}</span><br>`+
-        `Generate: <span style="color:var(--accent)">${d.genModel}</span><br>`+
-        `Dims: <span style="color:var(--muted)">${d.docDims||'(first insert sets this)'}</span><br>`+
-        `Documents: <span style="color:var(--text)">${d.docCount}</span>`;
+      const modelsStr = d.models && d.models.length ? `<br>Available models: <span style="color:var(--muted)">${d.models.slice(0,4).join(', ')}</span>` : '';
+      box.innerHTML=vdbInfo + ragInfo +
+        `<span style="color:var(--green)">● Connected to:</span> <span style="color:var(--accent)">${d.ollamaUrl}</span><br>`+
+        `Embed Model: <span style="color:var(--accent)">${d.embedModel}</span><br>`+
+        `Gen Model: <span style="color:var(--accent)">${d.genModel}</span><br>`+
+        `Documents: <span style="color:var(--text)">${d.docCount}</span>` + modelsStr;
     } else {
-      badge.className='badge err'; badge.textContent='OLLAMA ✗';
+      badge.className='badge err'; badge.textContent='AI OFFLINE ✗';
       box.className='ollama-status err';
-      box.innerHTML=`<span style="color:var(--red)">● Offline</span><br><br>`+
-        `To enable RAG features:<br>`+
-        `<span style="color:var(--muted)">1. Install from ollama.com<br>`+
-        `2. ollama pull nomic-embed-text<br>`+
-        `3. ollama pull llama3.2</span>`;
+      box.innerHTML=vdbInfo + ragInfo +
+        `<span style="color:var(--red)">● Not Connected to:</span> <span style="color:var(--muted)">${d.ollamaUrl||'http://127.0.0.1:11434'}</span><br>`+
+        `<span style="color:var(--muted);font-size:10px">Enter your remote server IP/URL above and click "CONNECT REMOTE SERVER".</span>`;
     }
   } catch(_) {}
+}
+
+async function saveServerConfig() {
+  const url = document.getElementById('serverUrlInput').value.trim();
+  const embedModel = document.getElementById('serverEmbedInput').value.trim();
+  const genModel = document.getElementById('serverGenInput').value.trim();
+  const box = document.getElementById('ollamaStatus');
+  box.innerHTML = '<span style="color:var(--muted)">Connecting to ' + (url || 'server') + '…</span>';
+
+  try {
+    const r = await fetch(API+'/config/ollama', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url, embedModel, genModel})
+    });
+    const d = await r.json();
+    await checkOllamaStatus();
+  } catch(e) {
+    alert('Failed to connect to server.');
+    checkOllamaStatus();
+  }
 }
 
 async function insertDocument() {
@@ -685,12 +805,12 @@ async function insertDocument() {
       document.getElementById('docTitle').value='';
       document.getElementById('docText').value='';
 
-          // Insert a 16D fake vector into the visualizer DB so it shows up on the map
-          const emb16 = textToEmbedding(title + ' ' + text);
-          fetch(API+'/insert', {
-            method:'POST', headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({metadata: title, category: 'doc', embedding: emb16})
-          }).then(() => { loadItems().then(loadHNSW); });
+      // Insert a 16D fake vector into the visualizer DB so it shows up on the map
+      const emb16 = textToEmbedding(title + ' ' + text);
+      fetch(API+'/insert', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({metadata: title, category: 'doc', embedding: emb16})
+      }).then(() => { loadItems().then(loadHNSW); });
 
       loadDocList(); checkOllamaStatus();
     }
@@ -734,12 +854,21 @@ document.getElementById('ragQuestion').addEventListener('keydown',e=>{
   if(e.key==='Enter'&&e.ctrlKey)askAI();
 });
 
+function getStepIcon(step) {
+  if (step === 'retrieve') return '🔍';
+  if (step === 'grade_documents') return '⚖️';
+  if (step === 'rewrite_query') return '🔄';
+  if (step === 'generate') return '⚡';
+  if (step === 'hallucination_check') return '🛡️';
+  return '●';
+}
+
 async function askAI() {
   const question=document.getElementById('ragQuestion').value.trim();
   if(!question)return;
   const k=parseInt(document.getElementById('ragK').value);
   const btn=document.getElementById('askBtn');
-  btn.disabled=true; btn.textContent='Thinking…';
+  btn.disabled=true; btn.textContent='Reasoning…';
 
   const history=document.getElementById('chatHistory');
   // Clear previous conversation
@@ -751,11 +880,33 @@ async function askAI() {
 
   // Show thinking indicator
   const thinkDiv=document.createElement('div'); thinkDiv.className='thinking';
-  thinkDiv.innerHTML='<div class="spinner"></div>Retrieving context & generating answer…';
+  thinkDiv.innerHTML='<div class="spinner"></div>Linear RAG retrieving context & synthesizing…';
   history.appendChild(thinkDiv);
   history.scrollTop=history.scrollHeight;
 
-  // Update the scatter plot visualizer in the background using the real 768D DB
+  // Update the scatter plot visualizer with query star and connections
+  const emb16 = textToEmbedding(question);
+  queryPt = projectToPCA(emb16);
+  hitIds = new Set();
+
+  // Find nearest vectors in 16D space to highlight and connect on the map
+  fetch(`${API}/search?v=${emb16.join(',')}&k=3&metric=cosine&algo=hnsw`)
+    .then(res2 => res2.json())
+    .then(data2 => {
+      if (data2.results && data2.results.length > 0) {
+        data2.results.forEach(r => hitIds.add(r.id));
+        if (!queryPt) {
+          let sx=0,sy=0,sw=0;
+          for (let i=0;i<Math.min(3,data2.results.length);i++) {
+            const pt=pcaPoints.find(p=>p.item.id===data2.results[i].id);
+            if(pt){const w=1/(i+1);sx+=pt.x*w;sy+=pt.y*w;sw+=w;}
+          }
+          if(sw>0) queryPt={x:sx/sw+(Math.random()-.5)*.015,y:sy/sw+(Math.random()-.5)*.015};
+        }
+      }
+    }).catch(()=>{});
+
+  // Also query 768D doc search and highlight matching doc chunks on map
   fetch(API+'/doc/search', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({question, k})
@@ -763,33 +914,10 @@ async function askAI() {
   .then(res=>res.json())
   .then(data => {
     if (data.contexts && data.contexts.length > 0) {
-      hitIds = new Set();
-      let sx=0, sy=0, sw=0;
-      data.contexts.forEach((ctx, i) => {
-        // Match the RAG chunk title back to the visualizer document metadata
+      data.contexts.forEach((ctx) => {
         const pt = pcaPoints.find(p => p.item.category === 'doc' && ctx.title.startsWith(p.item.metadata));
-        if (pt) {
-          hitIds.add(pt.item.id);
-          const w = 1/(i+1); sx += pt.x*w; sy += pt.y*w; sw += w;
-        }
+        if (pt) hitIds.add(pt.item.id);
       });
-      if (sw > 0) queryPt = {x: sx/sw + (Math.random()-.5)*.015, y: sy/sw + (Math.random()-.5)*.015};
-    } else {
-      hitIds = new Set();
-      // Fallback: If no RAG docs match, visually move the star to the 16D semantic space anyway!
-      const emb16 = textToEmbedding(question);
-      fetch(`${API}/search?v=${emb16.join(',')}&k=3&metric=cosine&algo=hnsw`)
-        .then(res2=>res2.json())
-        .then(data2 => {
-          if (data2.results && data2.results.length>0) {
-            let sx=0,sy=0,sw=0;
-            for (let i=0;i<Math.min(3,data2.results.length);i++) {
-              const pt=pcaPoints.find(p=>p.item.id===data2.results[i].id);
-              if(pt){const w=1/(i+1);sx+=pt.x*w;sy+=pt.y*w;sw+=w;}
-            }
-            if(sw>0) queryPt={x:sx/sw+(Math.random()-.5)*.015,y:sy/sw+(Math.random()-.5)*.015};
-          }
-        }).catch(()=>{});
     }
   }).catch(()=>{});
 
@@ -806,12 +934,37 @@ async function askAI() {
     if (d.error) {
       aDiv.innerHTML=`<div class="chat-a-label">ERROR</div><div class="chat-a-text" style="color:var(--red)">${d.error}</div>`;
     } else {
+      // Build Execution Trace if available
+      let traceHtml = '';
+      if (d.steps && d.steps.length > 0) {
+        const stepsHtml = d.steps.map((s, idx) => `
+          <div class="trace-step ${s.step||''}">
+            <div class="trace-icon">${getStepIcon(s.step)}</div>
+            <div class="trace-content">
+              <div class="trace-node">[${idx+1}] ${s.node || s.action || s.step}</div>
+              <div class="trace-detail">${s.detail || ''}</div>
+            </div>
+          </div>
+        `).join('');
+
+        traceHtml = `
+          <div class="trace-box">
+            <div class="trace-header">
+              <span>⚡ Linear RAG Execution Trace</span>
+              <span class="trace-badge">${d.workflow || 'Linear RAG'}</span>
+            </div>
+            ${stepsHtml}
+          </div>
+        `;
+      }
+
       // Build answer block with typewriter
-      aDiv.innerHTML=`<div class="chat-a-label">🤖 ${d.model||'llm'}</div>`+
+      aDiv.innerHTML=`${traceHtml}`+
+        `<div class="chat-a-label">🤖 ${d.model||'llm'} · LINEAR RAG</div>`+
         `<div class="chat-a-text" id="typeTarget"></div>`+
         `<div class="chat-ctx">`+
-          `<div class="chat-ctx-label">RETRIEVED CONTEXT (${d.contexts.length} chunks)</div>`+
-          d.contexts.map((c,i)=>`<span class="ctx-chip" onclick="toggleCtx(${i})">#${i+1} ${c.title} · ${c.distance.toFixed(3)}</span>`+
+          `<div class="chat-ctx-label">VERIFIED CONTEXT (${d.contexts ? d.contexts.length : 0} chunks)</div>`+
+          (d.contexts || []).map((c,i)=>`<span class="ctx-chip" onclick="toggleCtx(${i})">#${i+1} ${c.title} · ${c.distance.toFixed(3)}</span>`+
             `<div class="ctx-expand" id="ctx-${i}">${c.text}</div>`).join('')+
         `</div>`;
       history.appendChild(aDiv);
@@ -853,6 +1006,7 @@ function toggleCtx(i) {
 resize(); drawFrame();
 loadItems().then(loadHNSW);
 checkOllamaStatus();
+setInterval(checkOllamaStatus, 4000);
 </script>
 </body>
 </html>

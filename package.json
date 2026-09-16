@@ -1,0 +1,25 @@
+{
+  "name": "myai-vectordb-platform",
+  "version": "2.0.0",
+  "description": "3-Tier AI Platform: React.js + Canvas Frontend, Node.js Express Gateway, Python AI/ML Microservice",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "./start.sh",
+    "dev": "concurrently -n \"AI,GATEWAY\" -c \"magenta,cyan\" \"./.venv/bin/python3 ai_service.py\" \"node server.js\"",
+    "dev:backend": "node server.js",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:ai": "./.venv/bin/python3 ai_service.py",
+    "build:frontend": "cd frontend && npm run build",
+    "test": "node test_system.js",
+    "test:python": "./.venv/bin/python3 test_db.py"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "swagger-ui-express": "^5.0.1"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

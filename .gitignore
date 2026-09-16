@@ -4,10 +4,15 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
+.venv/
 venv/
+env/
 ENV/
 .pytest_cache/
+
+# ChromaDB data
+chroma_data/
+chroma_test*/
 
 # Compiled binaries
 *.exe
@@ -28,4 +33,3 @@ bin/
 # OS files
 .DS_Store
 Thumbs.db
-

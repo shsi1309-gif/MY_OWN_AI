@@ -1,15 +1,8 @@
-"""
-VectorDB — Pure Python Vector Database from Scratch with HNSW, KD-Tree, Brute Force & RAG.
-Zero external dependencies required (uses Python 3.8+ standard library).
-"""
-
-import http.server
 import json
 import math
 import os
 import random
 import re
-import socketserver
 import threading
 import time
 import urllib.error
@@ -17,6 +10,18 @@ import urllib.parse
 import urllib.request
 import heapq
 from typing import Callable, Dict, List, Optional, Tuple, Any
+
+from fastapi import FastAPI, HTTPException, Query, Path, Response
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
+
+try:
+    import chromadb
+    CHROMA_AVAILABLE = True
+except ImportError:
+    CHROMA_AVAILABLE = False
 
 DIMS = 16  # Demo vector dimensions
 
@@ -400,7 +405,7 @@ class HNSW:
 # =====================================================================
 
 class VectorDB:
-    def __init__(self, dims: int = DIMS):
+    def __init__(self, dims: int = DIMS, chroma_client: Optional[Any] = None):
         self.dims = dims
         self.store: Dict[int, VectorItem] = {}
         self.bf = BruteForce()
@@ -408,6 +413,16 @@ class VectorDB:
         self.hnsw = HNSW(16, 200)
         self.mu = threading.Lock()
         self.next_id = 1
+        self.chroma_client = chroma_client
+        self.chroma_col = None
+        if chroma_client is not None:
+            try:
+                self.chroma_col = chroma_client.get_or_create_collection(
+                    name="demo_vectors",
+                    metadata={"hnsw:space": "cosine"}
+                )
+            except Exception as e:
+                print(f"ChromaDB demo_vectors collection initialization note: {e}")
 
     def insert(
         self,
@@ -423,6 +438,15 @@ class VectorDB:
             self.bf.insert(v)
             self.kdt.insert(v)
             self.hnsw.insert(v, dist_fn)
+            if self.chroma_col is not None:
+                try:
+                    self.chroma_col.upsert(
+                        ids=[str(v.id)],
+                        embeddings=[v.emb],
+                        metadatas=[{"metadata": v.metadata, "category": v.category}],
+                    )
+                except Exception as e:
+                    print(f"ChromaDB insert note: {e}")
             return v.id
 
     def remove(self, item_id: int) -> bool:
@@ -433,6 +457,11 @@ class VectorDB:
             self.bf.remove(item_id)
             self.hnsw.remove(item_id)
             self.kdt.rebuild(list(self.store.values()))
+            if self.chroma_col is not None:
+                try:
+                    self.chroma_col.delete(ids=[str(item_id)])
+                except Exception:
+                    pass
             return True
 
     def search(
@@ -445,6 +474,41 @@ class VectorDB:
         with self.mu:
             dfn = get_dist_fn(metric)
             t0 = time.perf_counter()
+
+            if algo == "chromadb" and self.chroma_col is not None and len(self.store) > 0:
+                n_res = min(k, len(self.store))
+                res = self.chroma_col.query(
+                    query_embeddings=[q],
+                    n_results=n_res,
+                    include=["metadatas", "distances", "embeddings"]
+                )
+                us = int((time.perf_counter() - t0) * 1_000_000)
+                hits = []
+                if res and res.get("ids") and len(res["ids"]) > 0:
+                    for i, item_id_str in enumerate(res["ids"][0]):
+                        item_id = int(item_id_str) if item_id_str.isdigit() else 0
+                        dist = float(res["distances"][0][i]) if res.get("distances") else 0.0
+                        meta_dict = res["metadatas"][0][i] if res.get("metadatas") else {}
+                        emb_raw = res["embeddings"][0][i] if res.get("embeddings") is not None else (self.store[item_id].emb if item_id in self.store else [])
+                        if hasattr(emb_raw, "tolist"):
+                            emb = emb_raw.tolist()
+                        elif isinstance(emb_raw, (list, tuple)):
+                            emb = [float(x) for x in emb_raw]
+                        else:
+                            emb = []
+                        hits.append({
+                            "id": item_id,
+                            "metadata": meta_dict.get("metadata", self.store[item_id].metadata if item_id in self.store else ""),
+                            "category": meta_dict.get("category", self.store[item_id].category if item_id in self.store else "cs"),
+                            "distance": round(dist, 6),
+                            "embedding": emb,
+                        })
+                return {
+                    "results": hits,
+                    "latencyUs": us,
+                    "algo": algo,
+                    "metric": metric,
+                }
 
             if algo == "bruteforce":
                 raw = self.bf.knn(q, k, dfn)
@@ -488,11 +552,18 @@ class VectorDB:
             bf_us = time_fn(lambda: self.bf.knn(q, k, dfn))
             kd_us = time_fn(lambda: self.kdt.knn(q, k, dfn))
             hnsw_us = time_fn(lambda: self.hnsw.knn(q, k, 50, dfn))
+            chroma_us = 0
+            if self.chroma_col is not None and len(self.store) > 0:
+                try:
+                    chroma_us = time_fn(lambda: self.chroma_col.query(query_embeddings=[q], n_results=min(k, len(self.store))))
+                except Exception:
+                    chroma_us = 0
 
             return {
                 "bruteforceUs": bf_us,
                 "kdtreeUs": kd_us,
                 "hnswUs": hnsw_us,
+                "chromadbUs": chroma_us,
                 "itemCount": len(self.store),
             }
 
@@ -543,24 +614,63 @@ def chunk_text(
 class OllamaClient:
     def __init__(
         self,
-        host: str = "127.0.0.1",
+        base_url: Optional[str] = None,
+        host: Optional[str] = None,
         port: int = 11434,
-        embed_model: str = "nomic-embed-text",
-        gen_model: str = "llama3.2",
+        embed_model: Optional[str] = None,
+        gen_model: Optional[str] = None,
     ):
-        self.host = host
-        self.port = port
-        self.embed_model = embed_model
-        self.gen_model = gen_model
+        raw = (
+            base_url
+            or host
+            or os.environ.get("OLLAMA_HOST")
+            or os.environ.get("OLLAMA_URL")
+            or "http://127.0.0.1:11434"
+        ).strip()
+        self._base_url = self._normalize_url(raw, port)
+        self.embed_model = embed_model or os.environ.get("OLLAMA_EMBED_MODEL") or "nomic-embed-text"
+        self.gen_model = gen_model or os.environ.get("OLLAMA_GEN_MODEL") or "llama3.2"
+
+    def _normalize_url(self, raw: str, default_port: int = 11434) -> str:
+        url = raw.strip()
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = f"http://{url}"
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.port and not parsed.netloc.endswith(":11434") and "." not in parsed.netloc.split(":")[0]:
+            pass
+        return url.rstrip("/")
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return self._base_url
+
+    def set_url(
+        self,
+        url: str,
+        embed_model: Optional[str] = None,
+        gen_model: Optional[str] = None,
+    ) -> None:
+        self._base_url = self._normalize_url(url)
+        if embed_model:
+            self.embed_model = embed_model.strip()
+        if gen_model:
+            self.gen_model = gen_model.strip()
+
+    def list_models(self) -> List[str]:
+        try:
+            req = urllib.request.Request(f"{self.base_url}/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        except Exception:
+            pass
+        return []
 
     def is_available(self) -> bool:
         try:
             req = urllib.request.Request(f"{self.base_url}/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=2) as resp:
+            with urllib.request.urlopen(req, timeout=3) as resp:
                 return resp.status == 200
         except Exception:
             return False
@@ -604,21 +714,55 @@ class OllamaClient:
                     return data.get("response", "")
         except Exception:
             pass
-        return "ERROR: Ollama unavailable. Run: ollama serve"
+        return f"ERROR: Ollama server unavailable at {self.base_url}."
 
 
 # =====================================================================
-#  DOCUMENT DATABASE (HNSW over real Ollama embeddings)
+#  DOCUMENT DATABASE (ChromaDB + HNSW for real Ollama embeddings)
 # =====================================================================
 
 class DocumentDB:
-    def __init__(self):
+    def __init__(self, chroma_client: Optional[Any] = None):
         self.store: Dict[int, DocItem] = {}
         self.hnsw = HNSW(16, 200)
         self.bf = BruteForce()
         self.mu = threading.Lock()
         self.next_id = 1
         self.dims = 0
+        self.chroma_client = chroma_client
+        self.col = None
+        if chroma_client is not None:
+            try:
+                self.col = chroma_client.get_or_create_collection(
+                    name="rag_documents",
+                    metadata={"hnsw:space": "cosine"}
+                )
+                existing = self.col.get(include=["metadatas", "embeddings", "documents"])
+                if existing and existing.get("ids"):
+                    for i, id_str in enumerate(existing["ids"]):
+                        doc_id = int(id_str) if id_str.isdigit() else i + 1
+                        metas = existing["metadatas"][i] if existing.get("metadatas") else {}
+                        title = metas.get("title", f"Doc {doc_id}")
+                        text = metas.get("text", existing["documents"][i] if existing.get("documents") else "")
+                        emb_raw = existing["embeddings"][i] if existing.get("embeddings") is not None and len(existing["embeddings"]) > i else []
+                        if hasattr(emb_raw, "tolist"):
+                            emb = emb_raw.tolist()
+                        elif isinstance(emb_raw, (list, tuple)):
+                            emb = list(emb_raw)
+                        else:
+                            emb = []
+                        item = DocItem(doc_id, title, text, emb)
+                        self.store[doc_id] = item
+                        if emb:
+                            if self.dims == 0:
+                                self.dims = len(emb)
+                            vi = VectorItem(doc_id, title, "doc", emb)
+                            self.hnsw.insert(vi, cosine)
+                            self.bf.insert(vi)
+                        if doc_id >= self.next_id:
+                            self.next_id = doc_id + 1
+            except Exception as e:
+                print(f"ChromaDB rag_documents initialization note: {e}")
 
     def insert(self, title: str, text: str, emb: List[float]) -> int:
         with self.mu:
@@ -631,14 +775,46 @@ class DocumentDB:
             vi = VectorItem(doc_id, title, "doc", emb)
             self.hnsw.insert(vi, cosine)
             self.bf.insert(vi)
+
+            if self.col is not None:
+                try:
+                    self.col.upsert(
+                        ids=[str(doc_id)],
+                        embeddings=[emb],
+                        documents=[text],
+                        metadatas=[{"title": title, "text": text}],
+                    )
+                except Exception as e:
+                    print(f"ChromaDB doc insert note: {e}")
+
             return doc_id
 
     def search(
-        self, q: List[float], k: int, max_dist: float = 0.7
+        self, q: List[float], k: int, max_dist: Optional[float] = 1.2
     ) -> List[Tuple[float, DocItem]]:
         with self.mu:
             if not self.store:
                 return []
+
+            if self.col is not None and self.col.count() > 0:
+                try:
+                    n_res = min(k, len(self.store))
+                    res = self.col.query(
+                        query_embeddings=[q],
+                        n_results=n_res,
+                        include=["metadatas", "distances"]
+                    )
+                    out = []
+                    if res and res.get("ids") and len(res["ids"]) > 0:
+                        for i, doc_id_str in enumerate(res["ids"][0]):
+                            doc_id = int(doc_id_str) if doc_id_str.isdigit() else None
+                            dist = float(res["distances"][0][i]) if res.get("distances") else 0.0
+                            if doc_id in self.store and (max_dist is None or dist <= max_dist):
+                                out.append((dist, self.store[doc_id]))
+                    return out
+                except Exception as e:
+                    print(f"ChromaDB search note: {e}")
+
             raw = (
                 self.bf.knn(q, k, cosine)
                 if len(self.store) < 10
@@ -646,7 +822,7 @@ class DocumentDB:
             )
             out = []
             for d, item_id in raw:
-                if item_id in self.store and d <= max_dist:
+                if item_id in self.store and (max_dist is None or d <= max_dist):
                     out.append((d, self.store[item_id]))
             return out
 
@@ -657,6 +833,11 @@ class DocumentDB:
             del self.store[doc_id]
             self.hnsw.remove(doc_id)
             self.bf.remove(doc_id)
+            if self.col is not None:
+                try:
+                    self.col.delete(ids=[str(doc_id)])
+                except Exception:
+                    pass
             return True
 
     def all(self) -> List[Dict[str, Any]]:
@@ -670,6 +851,97 @@ class DocumentDB:
     def get_dims(self) -> int:
         with self.mu:
             return self.dims
+
+
+# =====================================================================
+#  LINEAR RAG PIPELINE (Deterministic Retrieval-Augmented Generation)
+# =====================================================================
+
+class LinearRAG:
+    """
+    High-Performance Deterministic Linear RAG Pipeline:
+      1. Embed Query via nomic-embed-text (768D)
+      2. Retrieve Top-K Nearest Document Chunks from VectorDB (ChromaDB / HNSW)
+      3. Format Context Prompt with Grounding Rules
+      4. Synthesize Grounded Answer using Local LLM (llama3.2)
+    """
+
+    def __init__(self, doc_db: DocumentDB, ollama: OllamaClient):
+        self.doc_db = doc_db
+        self.ollama = ollama
+
+    def run(self, question: str, k: int = 3) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        q_emb = self.ollama.embed(question)
+        if not q_emb:
+            return {
+                "answer": "Ollama service unavailable. Please ensure Ollama is running at " + self.ollama.base_url,
+                "error": "Ollama unavailable",
+                "contexts": [],
+                "docCount": self.doc_db.size(),
+                "workflow": "Linear RAG",
+                "steps": [],
+            }
+
+        hits = self.doc_db.search(q_emb, k)
+        contexts = [
+            {
+                "id": item.id,
+                "title": item.title,
+                "text": item.text,
+                "distance": round(dist, 4),
+            }
+            for dist, item in hits
+        ]
+
+        steps = [
+            {
+                "step": "retrieve",
+                "node": "Vector Retriever",
+                "action": "Vector Similarity Search",
+                "detail": f"Retrieved {len(hits)} nearest context chunk(s) from VectorDB for query: '{question}'",
+                "count": len(hits),
+                "timestamp": round(time.time(), 3),
+            }
+        ]
+
+        ctx_str = ""
+        for i, (dist, item) in enumerate(hits):
+            ctx_str += f"[{i+1}] Document: {item.title}\nContent: {item.text}\n\n"
+
+        if not hits or not ctx_str.strip():
+            ctx_str = "(No relevant documents found in knowledge base)\n\n"
+
+        prompt = (
+            "You are a helpful knowledge assistant. Use the following context (including document titles and content) to answer the user's question clearly and accurately.\n"
+            "- Synthesize your answer directly from the facts given in the context.\n"
+            "- If the context does not contain any relevant information to answer the question, say: 'I cannot answer this question based on the provided documents.'\n\n"
+            f"Context:\n{ctx_str}"
+            f"Question: {question}\n\n"
+            "Answer:"
+        )
+
+        answer = self.ollama.generate(prompt)
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+
+        steps.append({
+            "step": "generate",
+            "node": "Grounded Generator",
+            "action": "Linear Context Synthesis",
+            "detail": f"Synthesized grounded response in {elapsed_ms}ms using {len(hits)} chunk(s) via {self.ollama.gen_model}.",
+            "model": self.ollama.gen_model,
+            "timestamp": round(time.time(), 3),
+        })
+
+        return {
+            "answer": answer,
+            "model": self.ollama.gen_model,
+            "contexts": contexts,
+            "docCount": self.doc_db.size(),
+            "workflow": "Linear RAG",
+            "steps": steps,
+            "latency_ms": elapsed_ms,
+        }
 
 
 # =====================================================================
@@ -712,376 +984,317 @@ def load_demo(db: VectorDB) -> None:
 
 
 # =====================================================================
-#  HTTP REQUEST HANDLER
+#  PYDANTIC REQUEST SCHEMAS
 # =====================================================================
 
-class VectorDBHandler(http.server.BaseHTTPRequestHandler):
-    db: VectorDB
-    doc_db: DocumentDB
-    ollama: OllamaClient
-    html_content: bytes = b""
+class InsertVectorRequest(BaseModel):
+    metadata: str = Field(..., description="Description or label of the vector")
+    category: str = Field(..., description="Category: cs, math, food, sports, doc")
+    embedding: List[float] = Field(..., description="16D float embedding array")
 
-    def log_message(self, format: str, *args: Any) -> None:
-        # Suppress noisy standard HTTP access logs
-        pass
 
-    def send_cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+class InsertDocRequest(BaseModel):
+    title: str = Field(..., description="Title or topic of the document")
+    text: str = Field(..., description="Full text content of document")
 
-    def send_json(self, data: Any, status_code: int = 200) -> None:
-        body = json.dumps(data).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
 
-    def do_OPTIONS(self) -> None:
-        self.send_response(204)
-        self.send_cors_headers()
-        self.end_headers()
+class SearchDocRequest(BaseModel):
+    question: str = Field(..., description="Question to search context for")
+    k: int = Field(default=3, ge=1, le=20, description="Top-k chunks to retrieve")
 
-    def do_GET(self) -> None:
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path
-        query_params = urllib.parse.parse_qs(parsed_url.query)
 
-        # Serve index.html
-        if path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(self.html_content)))
-            self.send_cors_headers()
-            self.end_headers()
-            self.wfile.write(self.html_content)
-            return
+class AskDocRequest(BaseModel):
+    question: str = Field(..., description="Question for the RAG agent to answer")
+    k: int = Field(default=3, ge=1, le=20, description="Number of context chunks to use")
 
-        # GET /items
-        if path == "/items":
-            self.send_json(self.db.all())
-            return
 
-        # GET /search?v=...&k=5&metric=cosine&algo=hnsw
-        if path == "/search":
-            v_str = query_params.get("v", [""])[0]
-            try:
-                q = [float(x) for x in v_str.split(",") if x.strip()]
-            except ValueError:
-                q = []
+class ConfigOllamaRequest(BaseModel):
+    url: str = Field(default="", description="Ollama server URL")
+    embedModel: Optional[str] = Field(default=None, description="Embedding model name")
+    genModel: Optional[str] = Field(default=None, description="Generation LLM name")
 
-            if len(q) != DIMS:
-                self.send_json({"error": f"need {DIMS}D vector"}, 400)
-                return
 
-            try:
-                k = int(query_params.get("k", [5])[0])
-            except (ValueError, TypeError):
-                k = 5
+# =====================================================================
+#  FASTAPI APPLICATION FACTORY
+# =====================================================================
 
-            metric = query_params.get("metric", ["cosine"])[0] or "cosine"
-            algo = query_params.get("algo", ["hnsw"])[0] or "hnsw"
-
-            res = self.db.search(q, k, metric, algo)
-            self.send_json(res)
-            return
-
-        # GET /benchmark?v=...&k=5&metric=cosine
-        if path == "/benchmark":
-            v_str = query_params.get("v", [""])[0]
-            try:
-                q = [float(x) for x in v_str.split(",") if x.strip()]
-            except ValueError:
-                q = []
-
-            if len(q) != DIMS:
-                self.send_json({"error": f"need {DIMS}D vector"}, 400)
-                return
-
-            try:
-                k = int(query_params.get("k", [5])[0])
-            except (ValueError, TypeError):
-                k = 5
-
-            metric = query_params.get("metric", ["cosine"])[0] or "cosine"
-            res = self.db.benchmark(q, k, metric)
-            self.send_json(res)
-            return
-
-        # GET /hnsw-info
-        if path == "/hnsw-info":
-            self.send_json(self.db.hnsw_info())
-            return
-
-        # GET /status
-        if path == "/status":
-            ollama_up = self.ollama.is_available()
-            self.send_json({
-                "ollamaAvailable": ollama_up,
-                "embedModel": self.ollama.embed_model,
-                "genModel": self.ollama.gen_model,
-                "docCount": self.doc_db.size(),
-                "docDims": self.doc_db.get_dims(),
-                "demoDims": DIMS,
-                "demoCount": self.db.size(),
-            })
-            return
-
-        # GET /stats
-        if path == "/stats":
-            self.send_json({
-                "count": self.db.size(),
-                "dims": DIMS,
-                "algorithms": ["bruteforce", "kdtree", "hnsw"],
-                "metrics": ["euclidean", "cosine", "manhattan"],
-            })
-            return
-
-        # GET /doc/list
-        if path == "/doc/list":
-            self.send_json(self.doc_db.all())
-            return
-
-        self.send_json({"error": "Not Found"}, 404)
-
-    def do_POST(self) -> None:
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path
-
-        content_length = int(self.headers.get("Content-Length", 0))
-        body_bytes = self.rfile.read(content_length) if content_length > 0 else b""
+def create_app(db_path: Optional[str] = None) -> FastAPI:
+    if db_path is None:
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_data")
+    chroma_client = None
+    if CHROMA_AVAILABLE:
         try:
-            body_json = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+            os.makedirs(db_path, exist_ok=True)
+            chroma_client = chromadb.PersistentClient(path=db_path)
+        except Exception as e:
+            print(f"Warning: Could not initialize ChromaDB PersistentClient: {e}")
+
+    db = VectorDB(DIMS, chroma_client=chroma_client)
+    doc_db = DocumentDB(chroma_client=chroma_client)
+    ollama = OllamaClient()
+    linear_rag = LinearRAG(doc_db=doc_db, ollama=ollama)
+
+    load_demo(db)
+
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+    html_content = "<h1>VectorDB UI Not Found</h1>"
+    if os.path.exists(html_path):
+        try:
+            with open(html_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
         except Exception:
-            body_json = {}
+            pass
 
-        # POST /insert
-        if path == "/insert":
-            meta = body_json.get("metadata", "")
-            cat = body_json.get("category", "")
-            emb = body_json.get("embedding", [])
+    app = FastAPI(
+        title="VectorDB & Linear RAG API",
+        description="High-Performance Vector Database with HNSW, ChromaDB persistence, and Deterministic Linear RAG pipeline.",
+        version="2.0.0",
+        docs_url="/docs",
+        redoc_url="/redoc",
+    )
 
-            if not meta or not isinstance(emb, list) or len(emb) != DIMS:
-                self.send_json({"error": "invalid body"}, 400)
-                return
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-            dist_fn = get_dist_fn("cosine")
-            new_id = self.db.insert(meta, cat, emb, dist_fn)
-            self.send_json({"id": new_id})
-            return
+    # Attach state handles
+    app.state.db = db
+    app.state.doc_db = doc_db
+    app.state.ollama = ollama
+    app.state.rag = linear_rag
+    app.state.agentic_rag = linear_rag  # Backward compatibility
+    app.state.html_content = html_content
 
-        # POST /doc/insert
-        if path == "/doc/insert":
-            title = body_json.get("title", "").strip()
-            text = body_json.get("text", "").strip()
+    # ── Web UI ──
+    @app.get("/", response_class=HTMLResponse, summary="Serve Web UI Visualizer")
+    async def serve_index():
+        return HTMLResponse(content=app.state.html_content)
 
-            if not title or not text:
-                self.send_json({"error": "need title and text"}, 400)
-                return
+    # ── Demo Vector Endpoints ──
+    @app.get("/items", summary="List All Demo Vectors")
+    async def list_items():
+        return app.state.db.all()
 
-            chunks = chunk_text(text, 250, 30)
-            ids = []
+    @app.get("/search", summary="Search Nearest Vectors")
+    async def search_vectors(
+        v: str = Query(..., description="Comma-separated 16D vector values"),
+        k: int = Query(default=5, ge=1, le=50, description="Top-k nearest neighbors"),
+        metric: str = Query(default="cosine", description="Distance metric (cosine, euclidean, manhattan)"),
+        algo: str = Query(default="hnsw", description="Algorithm (chromadb, hnsw, kdtree, bruteforce)"),
+    ):
+        try:
+            v_str = v.strip()
+            if v_str.startswith("[") and v_str.endswith("]"):
+                import json
+                q = [float(x) for x in json.loads(v_str)]
+            else:
+                q = [float(x) for x in v_str.split(",") if x.strip()]
+        except Exception:
+            q = []
 
-            for i, chunk in enumerate(chunks):
-                emb = self.ollama.embed(chunk)
-                if not emb:
-                    self.send_json(
-                        {
-                            "error": (
-                                "Ollama unavailable. "
-                                "Install from https://ollama.com then run: "
-                                "ollama pull nomic-embed-text && ollama pull llama3.2"
-                            )
-                        },
-                        503,
-                    )
-                    return
+        if len(q) != DIMS:
+            raise HTTPException(status_code=400, detail=f"need {DIMS}D vector")
 
-                chunk_title = (
-                    f"{title} [{i+1}/{len(chunks)}]"
-                    if len(chunks) > 1
-                    else title
+        return app.state.db.search(q, k, metric, algo)
+
+    @app.get("/benchmark", summary="Benchmark All Vector Search Engines")
+    async def benchmark_engines(
+        v: str = Query(..., description="Comma-separated 16D vector values"),
+        k: int = Query(default=5, ge=1, le=50, description="Top-k results"),
+        metric: str = Query(default="cosine", description="Distance metric"),
+    ):
+        try:
+            v_str = v.strip()
+            if v_str.startswith("[") and v_str.endswith("]"):
+                import json
+                q = [float(x) for x in json.loads(v_str)]
+            else:
+                q = [float(x) for x in v_str.split(",") if x.strip()]
+        except Exception:
+            q = []
+
+        if len(q) != DIMS:
+            raise HTTPException(status_code=400, detail=f"need {DIMS}D vector")
+
+        return app.state.db.benchmark(q, k, metric)
+
+    @app.get("/hnsw-info", summary="Get HNSW Graph Topology and Layers")
+    async def get_hnsw_info():
+        return app.state.db.hnsw_info()
+
+    @app.get("/status", summary="Get System Status and Health")
+    async def get_status():
+        ollama_up = app.state.ollama.is_available()
+        models = app.state.ollama.list_models() if ollama_up else []
+        return {
+            "ollamaAvailable": ollama_up,
+            "ollamaUrl": app.state.ollama.base_url,
+            "embedModel": app.state.ollama.embed_model,
+            "genModel": app.state.ollama.gen_model,
+            "models": models,
+            "docCount": app.state.doc_db.size(),
+            "docDims": app.state.doc_db.get_dims(),
+            "demoDims": DIMS,
+            "demoCount": app.state.db.size(),
+            "chromaAvailable": CHROMA_AVAILABLE,
+            "ragWorkflow": "Linear RAG",
+            "vectorDbEngine": "ChromaDB (Persistent)" if CHROMA_AVAILABLE else "Pure-Python In-Memory",
+            "backendFramework": "FastAPI (Async)",
+            "persistencePath": "./chroma_data",
+        }
+
+    @app.get("/stats", summary="Get Vector Database Statistics")
+    async def get_stats():
+        return {
+            "count": app.state.db.size(),
+            "dims": DIMS,
+            "algorithms": ["chromadb", "hnsw", "kdtree", "bruteforce"] if CHROMA_AVAILABLE else ["hnsw", "kdtree", "bruteforce"],
+            "metrics": ["euclidean", "cosine", "manhattan"],
+            "vectorDbEngine": "ChromaDB" if CHROMA_AVAILABLE else "Custom Python",
+            "ragWorkflow": "Linear RAG",
+            "backendFramework": "FastAPI",
+            "persistencePath": "./chroma_data",
+        }
+
+    @app.post("/config/ollama", summary="Update Ollama Server Configuration")
+    async def configure_ollama(req: ConfigOllamaRequest):
+        url = req.url.strip()
+        if url:
+            app.state.ollama.set_url(url, req.embedModel, req.genModel)
+
+        available = app.state.ollama.is_available()
+        models = app.state.ollama.list_models() if available else []
+
+        return {
+            "ok": True,
+            "available": available,
+            "url": app.state.ollama.base_url,
+            "embedModel": app.state.ollama.embed_model,
+            "genModel": app.state.ollama.gen_model,
+            "models": models,
+        }
+
+    @app.post("/insert", summary="Insert Custom 16D Vector")
+    async def insert_vector(req: InsertVectorRequest):
+        if not req.metadata or len(req.embedding) != DIMS:
+            raise HTTPException(status_code=400, detail="invalid body or dimensions")
+
+        dist_fn = get_dist_fn("cosine")
+        new_id = app.state.db.insert(req.metadata, req.category, req.embedding, dist_fn)
+        return {"id": new_id}
+
+    @app.delete("/delete/{item_id}", summary="Delete 16D Vector by ID")
+    async def delete_vector(item_id: int = Path(..., description="ID of vector to delete")):
+        ok = app.state.db.remove(item_id)
+        return {"ok": ok}
+
+    # ── Document & RAG Endpoints ──
+    @app.get("/doc/list", summary="List All Persisted Documents")
+    async def list_documents():
+        return app.state.doc_db.all()
+
+    @app.post("/doc/insert", summary="Chunk, Embed, and Insert Document")
+    async def insert_doc(req: InsertDocRequest):
+        title = req.title.strip()
+        text = req.text.strip()
+        if not title or not text:
+            raise HTTPException(status_code=400, detail="need title and text")
+
+        chunks = chunk_text(text, 250, 30)
+        ids = []
+
+        for i, chunk in enumerate(chunks):
+            chunk_title = f"{title} [{i+1}/{len(chunks)}]" if len(chunks) > 1 else title
+            text_to_embed = f"Title: {title}\n{chunk}"
+            emb = app.state.ollama.embed(text_to_embed)
+            if not emb:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Ollama unavailable. Install from https://ollama.com then run: ollama pull nomic-embed-text && ollama pull llama3.2",
                 )
-                chunk_id = self.doc_db.insert(chunk_title, chunk, emb)
-                ids.append(chunk_id)
 
-            self.send_json({
-                "ids": ids,
-                "chunks": len(chunks),
-                "dims": self.doc_db.get_dims(),
-            })
-            return
+            chunk_id = app.state.doc_db.insert(chunk_title, chunk, emb)
+            ids.append(chunk_id)
 
-        # POST /doc/search
-        if path == "/doc/search":
-            question = body_json.get("question", "").strip()
-            k = body_json.get("k", 3)
-            try:
-                k = int(k)
-            except (ValueError, TypeError):
-                k = 3
+        return {
+            "ids": ids,
+            "chunks": len(chunks),
+            "dims": app.state.doc_db.get_dims(),
+        }
 
-            if not question:
-                self.send_json({"error": "need question"}, 400)
-                return
+    @app.post("/doc/search", summary="Search Documents by Semantic Vector")
+    async def search_doc(req: SearchDocRequest):
+        question = req.question.strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="need question")
 
-            q_emb = self.ollama.embed(question)
-            if not q_emb:
-                self.send_json({"error": "Ollama unavailable"}, 503)
-                return
+        q_emb = app.state.ollama.embed(question)
+        if not q_emb:
+            raise HTTPException(status_code=503, detail="Ollama unavailable")
 
-            hits = self.doc_db.search(q_emb, k)
-            contexts = [
-                {
-                    "id": item.id,
-                    "title": item.title,
-                    "distance": round(dist, 4),
-                }
-                for dist, item in hits
-            ]
-            self.send_json({"contexts": contexts})
-            return
+        hits = app.state.doc_db.search(q_emb, req.k)
+        contexts = [
+            {
+                "id": item.id,
+                "title": item.title,
+                "distance": round(dist, 4),
+            }
+            for dist, item in hits
+        ]
+        return {"contexts": contexts}
 
-        # POST /doc/ask
-        if path == "/doc/ask":
-            question = body_json.get("question", "").strip()
-            k = body_json.get("k", 3)
-            try:
-                k = int(k)
-            except (ValueError, TypeError):
-                k = 3
+    @app.post("/doc/ask", summary="Ask RAG Pipeline (Deterministic Linear RAG Flow)")
+    async def ask_doc(req: AskDocRequest):
+        question = req.question.strip()
+        if not question:
+            raise HTTPException(status_code=400, detail="need question")
 
-            if not question:
-                self.send_json({"error": "need question"}, 400)
-                return
+        res = app.state.rag.run(question, req.k)
+        if res.get("error"):
+            raise HTTPException(status_code=503, detail=res["error"])
 
-            # Step 1: Embed question
-            q_emb = self.ollama.embed(question)
-            if not q_emb:
-                self.send_json({"error": "Ollama unavailable"}, 503)
-                return
+        return res
 
-            # Step 2: Retrieve top-k chunks
-            hits = self.doc_db.search(q_emb, k)
+    @app.delete("/doc/delete/{doc_id}", summary="Delete Document by ID")
+    async def delete_document(doc_id: int = Path(..., description="ID of document to delete")):
+        ok = app.state.doc_db.remove(doc_id)
+        return {"ok": ok}
 
-            # Step 3: Build prompt
-            ctx_str = ""
-            for i, (dist, item) in enumerate(hits):
-                ctx_str += f"[{i+1}] {item.title}:\n{item.text}\n\n"
-
-            prompt = (
-                "You are a helpful assistant. Answer the user's question directly. "
-                "Use the provided context if it contains relevant information. "
-                "If it doesn't, just use your own general knowledge. "
-                "IMPORTANT: Do NOT mention the 'context', 'provided text', or say things like 'the context doesn't mention'. "
-                "Just answer the question naturally.\n\n"
-                f"Context:\n{ctx_str}"
-                f"Question: {question}\n\n"
-                "Answer:"
-            )
-
-            # Step 4: Generate answer
-            answer = self.ollama.generate(prompt)
-
-            # Step 5: Return response
-            contexts = [
-                {
-                    "id": item.id,
-                    "title": item.title,
-                    "text": item.text,
-                    "distance": round(dist, 4),
-                }
-                for dist, item in hits
-            ]
-
-            self.send_json({
-                "answer": answer,
-                "model": self.ollama.gen_model,
-                "contexts": contexts,
-                "docCount": self.doc_db.size(),
-            })
-            return
-
-        self.send_json({"error": "Not Found"}, 404)
-
-    def do_DELETE(self) -> None:
-        parsed_url = urllib.parse.urlparse(self.path)
-        path = parsed_url.path
-
-        # DELETE /delete/<id>
-        m_del = re.match(r"^/delete/(\d+)$", path)
-        if m_del:
-            item_id = int(m_del.group(1))
-            ok = self.db.remove(item_id)
-            self.send_json({"ok": ok})
-            return
-
-        # DELETE /doc/delete/<id>
-        m_doc_del = re.match(r"^/doc/delete/(\d+)$", path)
-        if m_doc_del:
-            doc_id = int(m_doc_del.group(1))
-            ok = self.doc_db.remove(doc_id)
-            self.send_json({"ok": ok})
-            return
-
-        self.send_json({"error": "Not Found"}, 404)
+    return app
 
 
 # =====================================================================
 #  SERVER ENTRY POINT
 # =====================================================================
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-def create_server(host: str = "0.0.0.0", port: int = 8080) -> ThreadedHTTPServer:
-    db = VectorDB(DIMS)
-    doc_db = DocumentDB()
-    ollama = OllamaClient()
-
-    load_demo(db)
-
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-    html_content = b"<h1>VectorDB UI Not Found</h1>"
-    if os.path.exists(html_path):
-        with open(html_path, "rb") as f:
-            html_content = f.read()
-
-    VectorDBHandler.db = db
-    VectorDBHandler.doc_db = doc_db
-    VectorDBHandler.ollama = ollama
-    VectorDBHandler.html_content = html_content
-
-    return ThreadedHTTPServer((host, port), VectorDBHandler)
+app = create_app()
 
 
 def main() -> None:
     port = int(os.environ.get("PORT", 8080))
     host = "0.0.0.0"
 
-    server = create_server(host, port)
-    ollama = VectorDBHandler.ollama
-    db = VectorDBHandler.db
+    ollama = app.state.ollama
+    db = app.state.db
 
     ollama_up = ollama.is_available()
-    print("=== VectorDB Engine (Python) ===")
-    print(f"http://localhost:{port}")
-    print(f"{db.size()} demo vectors | {DIMS} dims | HNSW+KD-Tree+BruteForce")
+    print("=== VectorDB Engine (FastAPI + ChromaDB + HNSW + Linear RAG) ===")
+    print(f"Backend Server: FastAPI + Uvicorn on http://localhost:{port}")
+    print(f"Interactive API Docs: http://localhost:{port}/docs")
+    print(f"Vector Database: {'ChromaDB (Persistent ./chroma_data)' if CHROMA_AVAILABLE else 'Pure Python (In-Memory)'}")
+    print(f"{db.size()} demo vectors | {DIMS} dims | ChromaDB+HNSW+KD-Tree+BruteForce")
+    print("RAG Engine: Linear RAG (Deterministic Vector Context Injection)")
     print(f"Ollama: {'ONLINE' if ollama_up else 'OFFLINE (install from ollama.com)'}")
     if ollama_up:
         print(f"  embed model: {ollama.embed_model}  gen model: {ollama.gen_model}")
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
-        server.shutdown()
-        server.server_close()
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
     main()
+
